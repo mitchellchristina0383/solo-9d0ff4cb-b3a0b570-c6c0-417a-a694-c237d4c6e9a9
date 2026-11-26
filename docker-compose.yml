@@ -1,0 +1,27 @@
+services:
+  web:
+    build: .
+    image: backup-verification-drill:1.0
+    container_name: backup-drill-web
+    ports:
+      - "8000:8000"
+    environment:
+      # 演练时钟、调度库 drill.db 与模拟集群库 cluster.db 都落在此目录
+      DATA_DIR: /data
+    volumes:
+      - drill-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3); sys.exit(0 if r.status==200 and json.load(r)['ok'] else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  # 命名卷：docker compose down/up、restart 后演练状态与集群 Job 都还在
+  drill-data:

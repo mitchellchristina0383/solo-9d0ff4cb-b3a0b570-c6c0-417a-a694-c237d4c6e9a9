@@ -1,0 +1,9 @@
+# 演练产生的两个 SQLite 库（本地直接运行时落在 ./data）
+/data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

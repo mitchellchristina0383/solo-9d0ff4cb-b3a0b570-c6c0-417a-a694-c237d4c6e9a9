@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>备份校验调度演练台</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">备</div>
+    <div>
+      <h1>备份校验调度演练台</h1>
+      <p class="sub">每 10 分钟一班 · 到点后 3 分钟补建窗口 · 模拟集群 SQLite 独立存 Job</p>
+    </div>
+  </div>
+  <div class="clock-card">
+    <div class="clock-label">模拟时钟（推进后持久化，重启接着练）</div>
+    <div id="sim-clock" class="clock">--:--:--</div>
+    <div id="sim-date" class="clock-date">----</div>
+  </div>
+</header>
+
+<main class="container">
+
+  <section class="panel controls">
+    <div class="control-group">
+      <span class="cg-title">① 推进时钟</span>
+      <div class="btn-row">
+        <button class="btn" onclick="advance(30)">+30 秒</button>
+        <button class="btn" onclick="advance(60)">+1 分钟</button>
+        <button class="btn" onclick="advance(180)">+3 分钟</button>
+        <button class="btn" onclick="advance(600)">+10 分钟</button>
+        <span class="custom-advance">
+          <input id="advance-min" type="number" min="1" max="1440" value="2" aria-label="自定义分钟">
+          <button class="btn" onclick="advanceCustom()">推进 N 分钟</button>
+        </span>
+      </div>
+    </div>
+    <div class="control-group">
+      <span class="cg-title">② 调度 / 查回</span>
+      <div class="btn-row">
+        <button class="btn primary" onclick="runScheduling()">▶ 立即触发调度（全部备份库）</button>
+        <button class="btn" title="同时发出 10 个调度请求，验证每班最多一个 Job" onclick="concurrentRuns(10)">⚡ 并发触发 ×10</button>
+        <button class="btn warn-outline" onclick="reconcile()">⟲ 一键查回所有丢失回执</button>
+        <button class="btn danger-outline" onclick="resetDrill()">重置演练</button>
+        <button class="btn ghost" onclick="loadState()">刷新</button>
+      </div>
+    </div>
+  </section>
+
+  <div id="lost-banner" class="lost-banner hidden"></div>
+
+  <details class="panel guide" open>
+    <summary>演练脚本（建议按此验证两条关键路径）</summary>
+    <ol>
+      <li><b>前班占用 → 窗口内补建：</b>10:00 触发调度建出 Job；推进到 10:10 后再触发，10:10 班显示“等待前班”；推进 1~2 分钟并结束前班 Job，再触发 → 10:10 班在 10:13 截止前“已建”。</li>
+      <li><b>超期等待 → 跳过：</b>保持前班运行，把时钟推进到 10:13 之后并触发，本班记“已跳过（前班未结束/满 3 分钟）”。</li>
+      <li><b>丢回执 + 超期 + 查回：</b>在某个备份库卡片上“布置一次性丢回执”，在窗口内触发调度：集群 Job 已建但页面拿不到 ID；把时钟推过 3 分钟再触发，班次记跳过且标红“回执丢失”；点“查回集群 Job”或“一键查回”，即可按幂等键找回集群原始 Job，班次转为“已建（查回）”。</li>
+      <li><b>并发：</b>可对同一时刻连续/并发点多次“触发调度”，或用仓库中的 tests/e2e_http.py 并发打接口；每班仍至多一个 Job，同库至多一个 RUNNING。</li>
+    </ol>
+  </details>
+
+  <section id="repo-cards" class="repo-grid"></section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>班次看板</h2>
+      <div id="filter-tabs" class="tabs"></div>
+      <div id="stats" class="stats"></div>
+    </div>
+    <div class="table-wrap">
+      <table class="shift-table">
+        <thead>
+        <tr>
+          <th>#</th><th>到点 / 截止</th><th>状态</th>
+          <th>集群 Job（cluster.db）</th><th>来源 / 说明</th><th class="ops">操作</th>
+        </tr>
+        </thead>
+        <tbody id="shift-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="bottom-grid">
+    <section class="panel">
+      <div class="panel-head"><h2>模拟集群 Job 列表（独立 SQLite）</h2>
+        <span class="hint">这是 cluster.db 的原始记录，回执丢了这里也在</span>
+      </div>
+      <div class="table-wrap small">
+        <table class="shift-table">
+          <thead><tr><th>Job ID</th><th>备份库</th><th>状态</th><th>实际创建(模拟)</th><th>幂等键</th></tr></thead>
+          <tbody id="cluster-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>调度事件流</h2><span class="hint">随操作持久化在 drill.db</span></div>
+      <ul id="event-list" class="events"></ul>
+    </section>
+  </div>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
