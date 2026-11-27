@@ -5,6 +5,8 @@
 
 - 值班员可在页面上：**推进模拟时钟 → 触发调度 → 结束 Job**，并可布置一次性“丢回执”故障、
   按班次/一键从集群查回 Job。
+- 演练跑久后可**清理结案班次**：选备份库、填保留班数（可填 0），按到点时间保留最新 N 班，
+  其余结案班次连同调度尝试一并删除；集群 Job 与事件流保留，已删班次重启/再调度都不会重建。
 - **演练控制库 `drill.db`** 保存模拟时钟、班次状态、调度尝试、事件流。
 - **模拟集群库 `cluster.db`** 独立保存真正的 Job，带幂等唯一键和
   “同一备份库至多一个 RUNNING”的部分唯一索引。
@@ -50,10 +52,10 @@ DATA_DIR=./data gunicorn --preload --workers 4 \
 ### 1.3 自动化核验脚本
 
 ```bash
-# 核心状态机/并发/重启单测（只用标准库 + 本仓库代码）
+# 核心状态机/并发/清理/重启单测（只用标准库 + 本仓库代码）
 PYTHONPATH=. python3 -m unittest tests.test_drill -v
 
-# 对已启动服务做 18 项 HTTP 端到端核验（含 12 并发、丢回执、超期、查回）
+# 对已启动服务做 31 项 HTTP 端到端核验（含 12 并发、丢回执、超期、查回、结案清理）
 pip install requests
 BASE_URL=http://127.0.0.1:8000 DATA_DIR=./data python3 scripts/e2e_check.py
 ```
@@ -76,6 +78,8 @@ BASE_URL=http://127.0.0.1:8000 DATA_DIR=./data python3 scripts/e2e_check.py
 | 重启后接着演练 | 模拟时钟、班次、事件、故障开关、Job 全部落盘；两个 Engine 均为“每次操作新开短连接”，多 worker/重启无内存状态 |
 | 页面按班次显示等待/跳过/已建 | 班次表展示：未到点 / 等待补建 / 等待前班 / 窗口已过待判定 / 已建 / 已跳过，以及回执丢失、查回来源、倒计时、Job 状态与操作 |
 | 回执丢了、补跑到期，仍能查回原 Job | 任意时刻可 `POST /api/shifts/<id>/lookup` 或 `/api/reconcile`，按幂等键直查 `cluster.db`；查到后班次转 `CREATED / LOOKUP`，并保留“曾跳过、超期后查回”标记与事件 |
+| 清理结案班次，保留最新 N 班（可填 0） | 页面 ③ 或 `POST /api/shifts/cleanup`；结案 = 已关联且集群 Job 已结束 / 已跳过且集群无同班 Job；待调度、运行中、回执待查的班一律保留且不占名额；单事务删除班次+调度尝试，失败整体回滚 |
+| 已删班次不得重建、不逐班重扫 | 每库一条 `meta` 清理水位线（被删班次最大到点时间）；补班网格从水位线之后开始生成，重启/推进时钟/再调度都不重建，也不留逐班删除标记；集群 Job 与事件流不动 |
 
 预置了两个备份库 `repo-alpha`、`repo-beta`：同库互斥，不同库的 Job 可以同时运行。
 
@@ -132,6 +136,7 @@ BASE_URL=http://127.0.0.1:8000 DATA_DIR=./data python3 scripts/e2e_check.py
 | `POST /api/faults/lost-receipt` | `{"repo_id":"...","armed":true}`，一次性故障布置/取消 |
 | `POST /api/shifts/<id>/lookup` | 按幂等键从集群查回单个班的原 Job |
 | `POST /api/reconcile` | 一键查回所有 `pending_lost_receipt=1` 的班 |
+| `POST /api/shifts/cleanup` | `{"repo_id":"...","keep":3}` 清理结案班次：保留最新 keep 班（可填 0），删除其余结案班及其调度尝试，返回删了几班 |
 | `POST /api/drill/reset` | 删除并重建两个 SQLite 库，回到 10:00 初始演练 |
 
 ### 用 curl 走一遍两条关键路径
@@ -181,8 +186,8 @@ curl "$B/api/cluster/jobs?repo_id=repo-alpha"   # 集群原始行始终都在
 │   ├── web.py                 # Flask 工厂 + 页面 + JSON API + 错误处理
 │   ├── templates/index.html   # 演练台页面
 │   └── static/{styles.css,app.js}
-├── tests/test_drill.py        # 12 项单测/并发竞争/重启测试
-└── scripts/e2e_check.py       # 18 项 HTTP 端到端核验
+├── tests/test_drill.py        # 18 项单测/并发竞争/清理/重启测试
+└── scripts/e2e_check.py       # 31 项 HTTP 端到端核验
 ```
 
 ---
@@ -192,7 +197,7 @@ curl "$B/api/cluster/jobs?repo_id=repo-alpha"   # 集群原始行始终都在
 实测环境：本沙箱 Debian、Python 3.11.2、SQLite 3.40.1、Node v22.23.4；
 宿主机原本没有 pip/Flask，已在独立目录安装 Flask 3.1.3、gunicorn 27.0.1、requests 用于实测。
 
-### 6.1 核心测试：12/12 通过
+### 6.1 核心测试：18/18 通过
 
 ```
 $ PYTHONPATH=/tmp/pylibs:/workspace python3 -m unittest tests.test_drill -v
@@ -205,58 +210,79 @@ test_busy_until_full_3min_then_skip ... ok
 test_idle_trigger_after_deadline_skips_window_expired ... ok
 test_lost_then_idempotent_retry_within_window ... ok
 test_lost_expire_then_lookup_after_restart ... ok
+test_cleanup_keep_newest_deletes_older_closed ... ok        # 保留最新 N 班，删旧班+调度尝试
+test_cleanup_keep_zero_and_active_shifts_untouched ... ok   # keep=0；回执待查/运行中/未到点班保留
+test_cleanup_no_regeneration_after_restart_advance_schedule ... ok  # 重启+推进+再调度不重建
+test_cleanup_failure_rolls_back ... ok                      # 清理中途失败，原数据完整保留
+test_cleanup_interleaved_with_scheduling_and_lookup ... ok  # 清理与调度/查回交错正常
+test_cleanup_validation ... ok
 test_parallel_scheduler_same_shift_creates_one_job ... ok      # 24 线程并发同一轮调度
 test_cluster_occupancy_hard_constraint_race ... ok             # 20 线程抢同库 RUNNING 名额
 test_same_idempotency_key_race_single_row ... ok
 ----------------------------------------------------------------------
-Ran 12 tests in 1.796s — OK
+Ran 18 tests in 3.182s — OK
 ```
 
 其中：20 个不同幂等键并发建同库 Job，恰好 1 个成功、19 个收到 `RepoOccupied`；
 12 个同幂等键并发只产生 1 行 Job；丢回执 + 超期 + 查回后**新建第二个 Engine
 指向同一批文件**，时钟（`T0+240`）与 `CREATED/LOOKUP` 状态都在。
 
-### 6.2 HTTP 端到端：18/18 通过（gunicorn `--preload --workers 4`）
+### 6.2 HTTP 端到端：31/31 通过（gunicorn `--preload --workers 4`）
 
 按 Docker 的同一 WSGI 入口和多 worker 模型在 `127.0.0.1:8765` 实跑
-（全新 `DATA_DIR=/tmp/drill-e2e2`），关键输出：
+（全新 `DATA_DIR=/tmp/drill-e2e-clean`），前 18 项为调度/丢回执/查回，后 13 项为清理场景，
+关键输出：
 
 ```
 [PASS] 12 个并发调度请求全部成功 -- ok=12/12
-[PASS] 并发后 beta 第 1 班只建出 1 个 Job -- jobs=['job-c9109bd55b6c']
-[PASS] alpha 10:00 班正常创建 -- job-0813873e4659
-[PASS] 10:10 班等待前班 -- bucket=blocked blocked=job-0813873e4659
+[PASS] 并发后 beta 第 1 班只建出 1 个 Job -- jobs=['job-a612e88d13b2']
+[PASS] alpha 10:00 班正常创建 -- job-bf8bc4b4bb56
+[PASS] 10:10 班等待前班 -- bucket=blocked blocked=job-bf8bc4b4bb56
 [PASS] 前班一直运行、满 3 分钟后本班跳过 -- SKIPPED/BUSY_TIMEOUT
 [PASS] 调度端收到一次回执丢失
 [PASS] 丢回执后班次保持 WAITING 且 pending=1
-[PASS] 集群侧实际已创建出运行中的 Job（调度端不知道 ID） -- job-4b86be442476
+[PASS] 集群侧实际已创建出运行中的 Job（调度端不知道 ID） -- job-ca8012b5af2a
 [PASS] 丢回执故障仅生效一次后自动撤防
 [PASS] 补跑也到期后标记跳过且保留丢回执线索 -- SKIPPED/LOST_RECEIPT_EXPIRED/pending=1
-[PASS] 查回 ... job_id == 集群原 Job job-4b86be442476, was_skipped=True
+[PASS] 查回 ... job_id == 集群原 Job job-ca8012b5af2a, was_skipped=True
 [PASS] 查回后 ... CREATED / LOOKUP / recovered_after_skip=1
 [PASS] 直接读 cluster.db 能查到原 Job 行
-       -- ('job-4b86be442476','RUNNING','backup-verify:repo-alpha:1795659600')
 [PASS] 10:30 班被查回的运行中 Job 挡住
-[PASS] 前班结束后在 3 分钟窗口内补建成功 -- job-d0e04d130471
-共 18 项检查，失败 0 项 — ALL E2E CHECKS PASSED
+[PASS] 前班结束后在 3 分钟窗口内补建成功 -- job-54e420435cab
+[PASS] beta 补跑到期班跳过 + 第 5 班丢回执待查 -- skipped=3 lost=1
+[PASS] beta 清理 keep=0 删除 4 班并显示数量 -- deleted_seqs=[1,2,3,4]
+[PASS] beta 已删班次从看板消失、第 5 班（回执待查）保留
+[PASS] beta 集群 Job 一个不少（清理不动 cluster.db）
+[PASS] 清理后回执待查班仍可查回集群原 Job
+[PASS] alpha 清理 keep=1 删除最旧 2 班、保留最新 1 班结案
+[PASS] alpha 1/2 班已删，3（保留的结案）与 4（运行中）都在
+[PASS] alpha 集群 Job 全部保留
+[PASS] 被删班次的调度尝试已一并删除 -- leftover=0
+[PASS] 清理水位线已落盘（每库一条，不逐班标记）
+[PASS] 推进+再调度后已删班次未重建
+[PASS] 事件流照常留存
+共 31 项检查，失败 0 项 — ALL E2E CHECKS PASSED
 ```
 
-### 6.3 重启后接着演练：通过
+### 6.3 重启后接着演练（含清理后重启）：通过
 
 对 4-worker gunicorn 发 SIGTERM 停服、用**同一 DATA_DIR** 重新启动后：
 
 ```
-[PASS] 重启后时钟/跳过班/查回班全部保留: 1795660320 {... 'created':4,'skipped':1 ...}
-[PASS] 重启后可继续推进时钟并正确调度（新班被运行中前班挡住）
-[PASS] cluster.db 中查回的原始 Job 重启后仍在，alpha 共 3 个 Job
+[PASS] 重启后已删班次未重建（水位线生效）: alpha=[3..12] beta=[5..12]
+[PASS] 重启后推进+再调度，已删班次仍未重建
+[PASS] 集群 Job 数量保持不变: 5（alpha 3 + beta 2）
+[PASS] 清理水位线每库一条: cleanup_horizon:repo-alpha / repo-beta
+[PASS] 重启后时钟/跳过班/查回班全部保留，可继续推进时钟并正确调度
 ```
 
-### 6.4 页面渲染：jsdom 23 项断言通过
+### 6.4 页面渲染：jsdom 断言通过
 
-用 jsdom 加载真实 `index.html/app.js`，喂入真实 `/api/state` 以及人为构造的
-“等待前班 / 窗口已过 / 回执丢失 / 超期跳过後查回 / 未到点”全分支状态：
-时钟、2 张库卡片、班次表、集群 Job 表、事件流、丢失横幅、12 类关键文案、
-筛选切换和全部按钮处理函数均无 JS 运行时错误。`node --check app.js` 也通过。
+用 jsdom 加载真实 `index.html/app.js`，喂入真实 `/api/state`（含清理后状态）：
+时钟、库卡片、班次表、集群 Job 表、事件流、丢失横幅正常渲染；清理控制组的
+备份库下拉（两个库）、保留班数输入（`min=0` 可填 0）、清理按钮的请求体
+（`{"repo_id","keep"}`）、删除数量 toast、负数输入前端拦截均验证通过。
+`node --check app.js` 也通过。
 
 ### 6.5 Docker 制品的核对
 
@@ -272,7 +298,7 @@ Ran 12 tests in 1.796s — OK
 
 1. **本沙箱没有安装/运行 Docker（也无 Podman/nerdctl，无 `/var/run/docker.sock`）**，
    因此我无法在这里字面执行 `docker compose up --build`。已做到的最大等价验证是：
-   用相同的 Python 3.11 依赖与完全相同的 gunicorn 多 worker 启动行跑通 18 项 HTTP 核验，
+   用相同的 Python 3.11 依赖与完全相同的 gunicorn 多 worker 启动行跑通 31 项 HTTP 核验，
    并静态校验 Compose YAML / healthcheck。交付到有 Docker 的环境后，
    `docker compose up --build` 应为一条命令成功；若构建有网络镜像问题可改用国内 pip 源。
 2. 这是**演练/教学工具**：没有登录鉴权、没有多用户权限隔离，定位为本机或可信内网使用。
@@ -282,5 +308,7 @@ Ran 12 tests in 1.796s — OK
    对演练规模绰绰有余，但不应外推为生产级分布式调度。
 5. “重置演练”会删除两个 SQLite 文件（页面上有二次确认）；正常 `restart/down/up` 不删卷，
    只有 `docker compose down -v` 或手动调 reset 才会清空。
-6. 未做真实浏览器截图像素级验收（环境无 Chromium），已用 jsdom 断言 + 静态资源 200 替代；
+6. “清理结案班次”删除的是控制库里的班次与调度尝试记录（页面上有二次确认），不可撤销；
+   集群 Job、事件流不受影响。清理水位线只随删除单调前进，唯一“撤销”方式是重置演练。
+7. 未做真实浏览器截图像素级验收（环境无 Chromium），已用 jsdom 断言 + 静态资源 200 替代；
    CSS 为手写无外部 CDN，离线可用。

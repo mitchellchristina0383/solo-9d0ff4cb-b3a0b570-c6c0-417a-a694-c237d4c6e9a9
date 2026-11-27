@@ -197,6 +197,84 @@ def main() -> int:
           s4["status"] == "CREATED" and s4["job_source"] == "RECEIPT",
           s4.get("cluster_job_id"))
 
+    # ---------- 9) 结案班次清理（含“清理时仍有回执待查”） ----------
+    # beta：结束运行中 Job，推进到 10:40，布置丢回执后调度
+    # -> beta 2/3/4 班超期跳过（集群无 Job），第 5 班丢回执待查
+    beta_running = [j for j in cluster_jobs(BETA) if j["status"] == "RUNNING"]
+    post(f"/api/jobs/{beta_running[0]['job_id']}/finish", {"result": "SUCCEEDED"})
+    post("/api/clock/advance", {"seconds": 480})   # 到 10:40
+    post("/api/faults/lost-receipt", {"repo_id": BETA, "armed": True})
+    r = post("/api/scheduler/run", {"repo_id": BETA})
+    check("beta 补跑到期班跳过 + 第 5 班丢回执待查",
+          len(r["summary"]["skipped"]) == 3 and len(r["summary"]["receipt_lost"]) == 1,
+          f"skipped={len(r['summary']['skipped'])} lost={len(r['summary']['receipt_lost'])}")
+    st = state()
+    beta5 = shift_by_seq(st, 5, BETA)
+    check("beta 第 5 班回执待查（WAITING/pending=1）",
+          beta5["status"] == "WAITING" and beta5["pending_lost_receipt"] == 1)
+    beta_deleted_ids = [shift_by_seq(st, i, BETA)["id"] for i in (1, 2, 3, 4)]
+
+    # 清理 beta，keep=0：删 4 个结案班（1 已结束 + 2/3/4 跳过无 Job），待查班保留
+    r = post("/api/shifts/cleanup", {"repo_id": BETA, "keep": 0})
+    res = r["result"]
+    check("beta 清理 keep=0 删除 4 班并显示数量",
+          res["deleted"] == 4 and res["deleted_seqs"] == [1, 2, 3, 4], str(res))
+    st = r["state"]
+    beta_seqs = {s["seq"] for s in st["shifts"] if s["repo_id"] == BETA}
+    check("beta 已删班次从看板消失、第 5 班（回执待查）保留",
+          not ({1, 2, 3, 4} & beta_seqs) and 5 in beta_seqs, f"seqs={sorted(beta_seqs)}")
+    check("beta 集群 Job 一个不少（清理不动 cluster.db）",
+          len(cluster_jobs(BETA)) == 2, str([j["job_id"] for j in cluster_jobs(BETA)]))
+
+    # 清理后回执待查的班仍可正常查回
+    r = post(f"/api/shifts/{beta5['id']}/lookup")
+    check("清理后回执待查班仍可查回集群原 Job",
+          r["result"]["found"] and shift_by_seq(r["state"], 5, BETA)["status"] == "CREATED")
+
+    # alpha：1 已结束、2 跳过无 Job、3 查回后已结束、4 仍 RUNNING
+    st = state()
+    alpha_deleted_ids = [shift_by_seq(st, i, ALPHA)["id"] for i in (1, 2)]
+    r = post("/api/shifts/cleanup", {"repo_id": ALPHA, "keep": 1})
+    res = r["result"]
+    check("alpha 清理 keep=1 删除最旧 2 班、保留最新 1 班结案",
+          res["deleted"] == 2 and res["deleted_seqs"] == [1, 2] and res["kept_closed"] == 1,
+          str(res))
+    st = r["state"]
+    alpha_seqs = {s["seq"] for s in st["shifts"] if s["repo_id"] == ALPHA}
+    check("alpha 1/2 班已删，3（保留的结案）与 4（运行中）都在",
+          1 not in alpha_seqs and 2 not in alpha_seqs
+          and 3 in alpha_seqs and 4 in alpha_seqs, f"seqs={sorted(alpha_seqs)}")
+    check("alpha 集群 Job 全部保留", len(cluster_jobs(ALPHA)) == 3)
+
+    # 直接只读核对：被删班次的调度尝试已随班删除
+    if DATA_DIR:
+        dpath = os.path.join(DATA_DIR, "drill.db")
+        con = sqlite3.connect(f"file:{dpath}?mode=ro", uri=True)
+        leftover = con.execute(
+            f"SELECT COUNT(*) FROM attempts WHERE shift_id IN "
+            f"({','.join('?' for _ in beta_deleted_ids + alpha_deleted_ids)})",
+            beta_deleted_ids + alpha_deleted_ids,
+        ).fetchone()[0]
+        horizon = con.execute(
+            "SELECT value FROM meta WHERE key='cleanup_horizon:repo-alpha'"
+        ).fetchone()
+        con.close()
+        check("被删班次的调度尝试已一并删除", leftover == 0, f"leftover={leftover}")
+        check("清理水位线已落盘（每库一条，不逐班标记）",
+              horizon is not None and int(horizon[0]) > 0, str(horizon))
+
+    # 清理后推进时钟 + 再次调度：已删班次不得重新生成
+    post("/api/clock/advance", {"seconds": 600})
+    post("/api/scheduler/run")
+    st = state()
+    alpha_seqs = {s["seq"] for s in st["shifts"] if s["repo_id"] == ALPHA}
+    beta_seqs = {s["seq"] for s in st["shifts"] if s["repo_id"] == BETA}
+    check("推进+再调度后已删班次未重建",
+          1 not in alpha_seqs and 2 not in alpha_seqs
+          and not ({1, 2, 3, 4} & beta_seqs),
+          f"alpha={sorted(alpha_seqs)} beta={sorted(beta_seqs)}")
+    check("事件流照常留存", len(st["events"]) > 0)
+
     # 终态统计
     st = state()
     print("\n===== 终态 =====")

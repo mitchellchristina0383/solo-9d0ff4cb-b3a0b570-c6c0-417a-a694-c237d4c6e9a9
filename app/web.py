@@ -94,6 +94,17 @@ def create_app(data_dir: str | Path | None = None) -> Flask:
                         "result": {"recovered": out["recovered"], "not_found": out["not_found"]},
                         "state": out["state"]})
 
+    @app.post("/api/shifts/cleanup")
+    def shifts_cleanup() -> Any:
+        """清理某备份库的结案班次：保留最新 keep 班，删除其余及其调度尝试。"""
+        body = request.get_json(silent=True) or {}
+        repo_id = body.get("repo_id")
+        if not repo_id:
+            raise ValidationError("repo_id 必填")
+        out = eng().cleanup_closed_shifts(repo_id, body.get("keep"))
+        result = {k: v for k, v in out.items() if k != "state"}
+        return jsonify({"ok": True, "result": result, "state": out["state"]})
+
     @app.post("/api/drill/reset")
     def drill_reset() -> Any:
         state = eng().reset()

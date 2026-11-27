@@ -48,6 +48,18 @@
         <button class="btn ghost" onclick="loadState()">刷新</button>
       </div>
     </div>
+    <div class="control-group">
+      <span class="cg-title">③ 清理结案班次</span>
+      <div class="btn-row">
+        <select id="cleanup-repo" class="cleanup-select" aria-label="选择备份库"></select>
+        <span class="custom-advance">
+          <input id="cleanup-keep" type="number" min="0" max="100000" value="3" aria-label="保留结案班次数（可填 0）">
+          <button class="btn warn-outline" onclick="cleanupShifts()">🧹 清理，仅保留最新 N 班</button>
+        </span>
+      </div>
+      <div class="cg-note">只清理“已关联且集群已结束 / 已跳过且集群无同班 Job”的结案班次及其调度尝试；
+        待调度、运行中、回执待查的班次一律保留且不占名额；集群 Job 与事件流不受影响。</div>
+    </div>
   </section>
 
   <div id="lost-banner" class="lost-banner hidden"></div>
@@ -59,6 +71,7 @@
       <li><b>超期等待 → 跳过：</b>保持前班运行，把时钟推进到 10:13 之后并触发，本班记“已跳过（前班未结束/满 3 分钟）”。</li>
       <li><b>丢回执 + 超期 + 查回：</b>在某个备份库卡片上“布置一次性丢回执”，在窗口内触发调度：集群 Job 已建但页面拿不到 ID；把时钟推过 3 分钟再触发，班次记跳过且标红“回执丢失”；点“查回集群 Job”或“一键查回”，即可按幂等键找回集群原始 Job，班次转为“已建（查回）”。</li>
       <li><b>并发：</b>可对同一时刻连续/并发点多次“触发调度”，或用仓库中的 tests/e2e_http.py 并发打接口；每班仍至多一个 Job，同库至多一个 RUNNING。</li>
+      <li><b>清理结案班次：</b>演练跑久后，在上方 ③ 选备份库、填保留班数（可填 0）再点清理：按到点时间保留最新 N 班结案班次，其余结案班次连同调度尝试一并删除并显示删了几班；清理后推进时钟/再调度/重启都不会重建已删班次。</li>
     </ol>
   </details>
 

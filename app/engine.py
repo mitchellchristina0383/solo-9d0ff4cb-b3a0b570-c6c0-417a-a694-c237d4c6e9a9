@@ -63,16 +63,38 @@ class Engine:
         self._ensure_all_shifts()
 
     # ------------------------------------------------------------------ utils
+    @staticmethod
+    def _horizon_key(repo_id: str) -> str:
+        return f"cleanup_horizon:{repo_id}"
+
+    def _cleanup_horizon(self, conn: sqlite3.Connection, repo_id: str) -> int:
+        """该库的清理水位线（due_ts 上限）：<= 水位的历史班次已被清理，不再重建。
+
+        每库只有一条 meta 记录，不逐班保留删除标记。
+        """
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key=?", (self._horizon_key(repo_id),)
+        ).fetchone()
+        return int(row["value"]) if row else 0
+
     def _ensure_shifts_locked(
         self, conn: sqlite3.Connection, now_ts: int
     ) -> int:
-        """生成从锚点到 now+LOOKAHEAD 的全部班次（幂等）。返回新插入数量。"""
+        """生成从锚点到 now+LOOKAHEAD 的全部班次（幂等）。返回新插入数量。
+
+        已被清理的历史（due_ts <= 该库清理水位线）直接跳过：既不逐班重扫，
+        也不会在重启/推进时钟/再次调度后把已删班次重新生成。
+        """
         target = int(now_ts) + LOOKAHEAD_SEC
         k_max = max(0, (target - ANCHOR_TS) // SHIFT_INTERVAL_SEC)
         repos = [r["id"] for r in conn.execute("SELECT id FROM repositories").fetchall()]
         inserted = 0
         for repo_id in repos:
-            for k in range(k_max + 1):
+            horizon = self._cleanup_horizon(conn, repo_id)
+            k_min = 0
+            if horizon:
+                k_min = max(0, (horizon - ANCHOR_TS) // SHIFT_INTERVAL_SEC + 1)
+            for k in range(k_min, k_max + 1):
                 due_ts = ANCHOR_TS + k * SHIFT_INTERVAL_SEC
                 idem = f"backup-verify:{repo_id}:{due_ts}"
                 cur = conn.execute(
@@ -513,6 +535,112 @@ class Engine:
         finally:
             conn.close()
         return {"recovered": recovered, "not_found": not_found, "state": self.state()}
+
+    # ------------------------------------------------------------- cleanup
+    def _shift_is_closed(self, s: sqlite3.Row) -> bool:
+        """结案判定（只读集群库）。
+
+        结案 = 已关联且集群 Job 已结束，或已跳过且集群没有同班 Job。
+        待调度 / 仍在运行 / 有丢失回执待查的班次一律不算结案。
+        判定是单调的：班次一旦结案，之后不会再变回未结案
+        （Job 结束不可逆；已跳过的班不会再被调度，集群不会再生出同班 Job）。
+        """
+        if s["pending_lost_receipt"]:
+            return False
+        if s["status"] == "CREATED":
+            jid = s["cluster_job_id"]
+            if not jid:
+                return False
+            job = self.cluster.get_job(jid)
+            return job is not None and job["status"] != "RUNNING"
+        if s["status"] == "SKIPPED":
+            return self.cluster.get_job_by_idem(s["idem_key"]) is None
+        return False
+
+    def cleanup_closed_shifts(self, repo_id: str, keep: int) -> dict[str, Any]:
+        """清理某备份库的结案班次：按到点时间保留最新 keep 班，删除其余结案
+        班次及其调度尝试；集群 Job 与事件流不动。
+
+        - 待调度 / 仍在运行 / 回执待查的班次一律保留，且不占 keep 名额；
+        - 整个清理在控制库单个 BEGIN IMMEDIATE 事务内完成，与调度/查回
+          （同一把写锁）串行化，交错时活跃班次照常处理；
+        - 任何一步失败都整体回滚，原始数据不变；
+        - 删除后把该库清理水位线推进到被删班次的最大到点时间，
+          重启/推进时钟/再次调度都不会重建已删班次。
+        """
+        try:
+            keep = int(keep)
+        except (TypeError, ValueError):
+            raise ValidationError("保留班次数必须是整数")
+        if keep < 0:
+            raise ValidationError("保留班次数不能为负数（可填 0）")
+        if keep > 100000:
+            raise ValidationError("保留班次数过大")
+
+        repos = {r["id"] for r in self.store.list_repos()}
+        if repo_id not in repos:
+            raise NotFound(f"未知备份库 {repo_id}")
+
+        conn = self.store.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = int(
+                conn.execute(
+                    "SELECT value FROM meta WHERE key='sim_now_ts'"
+                ).fetchone()["value"]
+            )
+            rows = conn.execute(
+                "SELECT * FROM shifts WHERE repo_id=? ORDER BY due_ts ASC, id ASC",
+                (repo_id,),
+            ).fetchall()
+            closed = [r for r in rows if self._shift_is_closed(r)]
+            n_delete = max(0, len(closed) - keep)
+            to_delete = closed[:n_delete]
+            kept_closed = closed[n_delete:]
+            deleted_seqs = [int(r["seq"]) for r in to_delete]
+
+            if to_delete:
+                ids = [int(r["id"]) for r in to_delete]
+                ph = ",".join("?" for _ in ids)
+                conn.execute(f"DELETE FROM attempts WHERE shift_id IN ({ph})", ids)
+                conn.execute(f"DELETE FROM shifts WHERE id IN ({ph})", ids)
+                horizon = max(int(r["due_ts"]) for r in to_delete)
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value "
+                    "WHERE CAST(excluded.value AS INTEGER) > CAST(meta.value AS INTEGER)",
+                    (self._horizon_key(repo_id), str(horizon)),
+                )
+            self.store.add_event(
+                conn,
+                sim_ts=now,
+                level="info",
+                repo_id=repo_id,
+                message=(
+                    f"清理结案班次：删除 {len(to_delete)} 班"
+                    + (f"（班次号 {deleted_seqs}）" if to_delete else "")
+                    + f"，按到点时间保留最新 {keep} 班结案班次；"
+                      "待调度/运行中/回执待查班次未动，集群 Job 与事件流保留"
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+        return {
+            "repo_id": repo_id,
+            "keep": keep,
+            "deleted": len(to_delete),
+            "deleted_seqs": deleted_seqs,
+            "kept_closed": len(kept_closed),
+            "state": self.state(),
+        }
 
     # ------------------------------------------------------------------ jobs
     def finish_job(self, job_id: str, result: str = "SUCCEEDED") -> dict[str, Any]:

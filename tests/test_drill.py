@@ -202,6 +202,187 @@ class TestLostReceipt(DrillTestBase):
         self.assertEqual(eng2.cluster.count_jobs(), 1)
 
 
+class TestCleanup(DrillTestBase):
+    """结案班次清理：保留最新 N 班、活跃班次不动、失败回滚、不重建。"""
+
+    def _run_and_finish(self) -> str:
+        """调度当前最早待处理班并立即结束其 Job，制造一个结案班。"""
+        out = self.eng.run_scheduling(REPO)
+        self.assertEqual(len(out["created"]), 1, out)
+        jid = out["created"][0]["job_id"]
+        self.eng.finish_job(jid)
+        return jid
+
+    def _counts(self) -> tuple[int, int]:
+        conn = self.eng.store.connect()
+        try:
+            s = conn.execute("SELECT COUNT(*) AS c FROM shifts").fetchone()["c"]
+            a = conn.execute("SELECT COUNT(*) AS c FROM attempts").fetchone()["c"]
+            return int(s), int(a)
+        finally:
+            conn.close()
+
+    def test_cleanup_keep_newest_deletes_older_closed(self):
+        for i in range(3):  # 班 1/2/3：已建且集群已结束（结案）
+            if i:
+                self.eng.advance_clock(600)
+            self._run_and_finish()
+        # 班 4：超期跳过、集群无同班 Job（结案）
+        self.eng.advance_clock(600 + 180)
+        out = self.eng.run_scheduling(REPO)
+        self.assertEqual(out["skipped"][0]["reason"], "WINDOW_EXPIRED")
+
+        res = self.eng.cleanup_closed_shifts(REPO, 2)
+        self.assertEqual(res["deleted"], 2)
+        self.assertEqual(res["deleted_seqs"], [1, 2])
+        self.assertEqual(res["kept_closed"], 2)
+
+        seqs = {s["seq"] for s in self.eng.state()["shifts"] if s["repo_id"] == REPO}
+        self.assertNotIn(1, seqs)
+        self.assertNotIn(2, seqs)
+        self.assertIn(3, seqs)
+        self.assertIn(4, seqs)
+        # 集群 Job 全部保留
+        self.assertEqual(len(self.alpha_jobs()), 3)
+        # 被删班次的调度尝试一并删除：只剩班 3 的 RECEIVED 与班 4 的 SKIPPED
+        _, attempts = self._counts()
+        self.assertEqual(attempts, 2)
+
+    def test_cleanup_keep_zero_and_active_shifts_untouched(self):
+        self._run_and_finish()            # 班 1：结案
+        self.eng.advance_clock(600)
+        # 班 2：丢回执待查（WAITING + pending=1，集群侧有 RUNNING Job）
+        self.eng.set_fault(REPO, True)
+        out = self.eng.run_scheduling(REPO)
+        self.assertEqual(len(out["receipt_lost"]), 1)
+
+        res = self.eng.cleanup_closed_shifts(REPO, 0)   # 可填 0
+        self.assertEqual(res["deleted"], 1)
+        self.assertEqual(res["deleted_seqs"], [1])
+
+        # 回执待查的班 2 保留、不占名额，且清理后仍可正常查回
+        s2 = self.shift(2)
+        self.assertEqual(s2["status"], "WAITING")
+        self.assertEqual(s2["pending_lost_receipt"], 1)
+        r = self.eng.lookup_shift(s2["id"])
+        self.assertTrue(r["found"])
+        self.assertEqual(self.shift(2)["status"], "CREATED")
+
+        # 仍在运行的班同样保留：班 2 的 Job 还在 RUNNING，班 3 未到点也保留
+        self.assertEqual(len(self.alpha_jobs()), 2)
+        seqs = {s["seq"] for s in self.eng.state()["shifts"] if s["repo_id"] == REPO}
+        self.assertIn(3, seqs)
+
+    def test_cleanup_no_regeneration_after_restart_advance_schedule(self):
+        self._run_and_finish()
+        self.eng.advance_clock(600)
+        self._run_and_finish()
+        res = self.eng.cleanup_closed_shifts(REPO, 0)
+        self.assertEqual(res["deleted"], 2)
+
+        # 推进时钟 + 再次调度：已删班次不得重新生成
+        self.eng.advance_clock(3600)
+        self.eng.run_scheduling(REPO)
+        seqs = {s["seq"] for s in self.eng.state()["shifts"] if s["repo_id"] == REPO}
+        self.assertNotIn(1, seqs)
+        self.assertNotIn(2, seqs)
+
+        # 重启（新 Engine 指向同一批文件）后再推进、再调度：仍不得重建
+        eng2 = Engine(
+            Path(self._tmp.name) / "drill.db",
+            Path(self._tmp.name) / "cluster.db",
+        )
+        eng2.advance_clock(600)
+        eng2.run_scheduling(REPO)
+        seqs2 = {s["seq"] for s in eng2.state()["shifts"] if s["repo_id"] == REPO}
+        self.assertNotIn(1, seqs2)
+        self.assertNotIn(2, seqs2)
+
+        # 不逐班保留删除标记：每库只有一条水位线 meta
+        conn = eng2.store.connect()
+        try:
+            rows = conn.execute(
+                "SELECT key FROM meta WHERE key LIKE 'cleanup_horizon:%'"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([r["key"] for r in rows], ["cleanup_horizon:repo-alpha"])
+
+    def test_cleanup_failure_rolls_back(self):
+        self._run_and_finish()
+        self.eng.advance_clock(600)
+        self._run_and_finish()
+        shifts_before, attempts_before = self._counts()
+
+        original = self.eng.store.add_event
+
+        def boom(conn, **kwargs):
+            raise RuntimeError("simulated cleanup failure")
+
+        self.eng.store.add_event = boom  # 在删除之后、提交之前失败
+        try:
+            with self.assertRaises(RuntimeError):
+                self.eng.cleanup_closed_shifts(REPO, 0)
+        finally:
+            self.eng.store.add_event = original
+
+        # 原数据完整保留，水位线也未写入
+        self.assertEqual(self._counts(), (shifts_before, attempts_before))
+        self.assertIsNone(self.eng.store.get_meta("cleanup_horizon:repo-alpha"))
+        # 故障清除后重试可成功
+        res = self.eng.cleanup_closed_shifts(REPO, 0)
+        self.assertEqual(res["deleted"], 2)
+
+    def test_cleanup_interleaved_with_scheduling_and_lookup(self):
+        self._run_and_finish()
+        self.eng.advance_clock(600)
+        self._run_and_finish()
+        self.eng.advance_clock(600)
+        self.eng.set_fault(REPO, True)
+        self.eng.run_scheduling(REPO)  # 班 3：回执待查
+        s3_id = self.shift(3)["id"]
+
+        errors: list[Exception] = []
+
+        def guard(fn):
+            def run():
+                try:
+                    fn()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+            return run
+
+        fns = [
+            guard(lambda: self.eng.cleanup_closed_shifts(REPO, 0)),
+            guard(lambda: self.eng.run_scheduling(REPO)),
+            guard(lambda: self.eng.lookup_shift(s3_id)),
+        ] * 4
+        threads = [threading.Thread(target=f) for f in fns]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        seqs = {s["seq"] for s in self.eng.state()["shifts"] if s["repo_id"] == REPO}
+        self.assertNotIn(1, seqs)   # 结案班已删
+        self.assertNotIn(2, seqs)
+        # 交错中班 3 被正常处理：窗口内经调度幂等关联或查回，转为已建
+        s3 = self.shift(3)
+        self.assertEqual(s3["status"], "CREATED")
+        self.assertEqual(s3["pending_lost_receipt"], 0)
+        self.assertEqual(len(self.alpha_jobs()), 3)  # 每班仍至多一个 Job
+
+    def test_cleanup_validation(self):
+        with self.assertRaises(Exception):
+            self.eng.cleanup_closed_shifts(REPO, -1)
+        with self.assertRaises(Exception):
+            self.eng.cleanup_closed_shifts("no-such-repo", 1)
+        # 没有结案班时清理是安全的空操作
+        res = self.eng.cleanup_closed_shifts(REPO, 0)
+        self.assertEqual(res["deleted"], 0)
+
+
 class TestConcurrency(DrillTestBase):
     def test_parallel_scheduler_same_shift_creates_one_job(self):
         errors: list[Exception] = []

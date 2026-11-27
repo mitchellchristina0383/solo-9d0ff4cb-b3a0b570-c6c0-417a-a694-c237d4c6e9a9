@@ -95,6 +95,26 @@ window.resetDrill = async () => {
   toast("演练已重置");
 };
 
+window.cleanupShifts = async () => {
+  const repoId = document.getElementById("cleanup-repo").value;
+  const keepRaw = document.getElementById("cleanup-keep").value;
+  const keep = parseInt(keepRaw, 10);
+  if (!repoId) return toast("请选择要清理的备份库", true);
+  if (!Number.isInteger(keep) || keep < 0) return toast("保留班次数必须是不小于 0 的整数（可填 0）", true);
+  if (!confirm(
+    `确定清理 ${repoId} 的结案班次？\n` +
+    `按到点时间保留最新 ${keep} 班，其余结案班次及其调度尝试将被删除。\n` +
+    "待调度/运行中/回执待查的班次一律保留；集群 Job 与事件流不受影响。"
+  )) return;
+  const data = await api("/api/shifts/cleanup", { repo_id: repoId, keep }).catch(() => null);
+  if (data && data.result) {
+    const r = data.result;
+    toast(r.deleted > 0
+      ? `清理完成：删除 ${r.deleted} 班（班次号 ${r.deleted_seqs.join(", ")}），保留结案 ${r.kept_closed} 班`
+      : "没有需要清理的结案班次");
+  }
+};
+
 window.concurrentRuns = async (n) => {
   n = n || 10;
   toast(`并发发出 ${n} 个调度请求…`);
@@ -177,6 +197,16 @@ function renderTabs() {
   document.getElementById("filter-tabs").innerHTML = tabs.map((t) =>
     `<button class="tab ${FILTER === t.id ? "active" : ""}" onclick="setFilter('${esc(t.id)}')">${esc(t.name)}</button>`
   ).join("");
+}
+
+function renderCleanupSelect() {
+  const sel = document.getElementById("cleanup-repo");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = STATE.repos.map((r) =>
+    `<option value="${esc(r.id)}">${esc(r.name)}（${esc(r.id)}）</option>`
+  ).join("");
+  if (cur && STATE.repos.some((r) => r.id === cur)) sel.value = cur;
 }
 
 function renderStats() {
@@ -296,6 +326,7 @@ function render() {
   renderClock();
   renderRepos();
   renderTabs();
+  renderCleanupSelect();
   renderStats();
   renderLostBanner();
   renderShifts();
